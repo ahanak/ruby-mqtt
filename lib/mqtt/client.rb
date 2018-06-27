@@ -319,23 +319,31 @@ module MQTT
         :payload => payload
       )
 
-      # Send the packet
-      res = send_packet(packet)
-
-      return if qos.zero?
-
-      Timeout.timeout(@ack_timeout) do
-        while connected?
-          @pubacks_semaphore.synchronize do
-            return res if @pubacks.delete(packet.id)
-          end
-          # FIXME: make threads communicate with each other, instead of polling
-          # (using a pipe and select ?)
-          sleep 0.01
+      if qos != 0
+        queue = Queue.new
+        @pubacks_semaphore.synchronize do
+          @pubacks[packet.id] = queue
         end
       end
 
-      -1
+      # Send the packet
+      res = send_packet(packet)
+
+      if qos != 0
+        begin
+          Timeout.timeout(@ack_timeout) do
+            queue.pop
+          end
+        rescue TimeoutError => e
+          puts "Expected Suback #{packet.id} missing"
+          throw e
+        ensure
+          @pubacks_semaphore.synchronize do
+            @pubacks.delete(packet.id)
+          end
+        end
+      end
+      res
     end
 
     # Send a subscribe message for one or more topics on the MQTT server.
@@ -466,7 +474,7 @@ module MQTT
         @last_ping_response = Time.now
       elsif packet.class == MQTT::Packet::Puback
         @pubacks_semaphore.synchronize do
-          @pubacks[packet.id] = packet
+          @pubacks[packet.id] << packet if @pubacks[packet.id]
         end
       end
       # Ignore all other packets
@@ -539,7 +547,8 @@ module MQTT
     end
 
     def next_packet_id
-      @last_packet_id = (@last_packet_id || 0).next
+      # MQTT supports 2 bytes packet ids
+      @last_packet_id = (@last_packet_id || 0).next % 0x10000
     end
 
     # ---- Deprecated attributes and methods  ---- #
